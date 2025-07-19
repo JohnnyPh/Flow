@@ -56,7 +56,7 @@ jobs:
 
       - name: Download IPA (Auto from App Store)
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.ipa_url == '')
-        uses: level3tjg/decryptedappstore-action@main
+        uses: JohnnyPh/decryptedappstore-action@main
         with:
           appstore_url: "https://apps.apple.com/us/app/messenger/id454638411"
           path: ${{ github.workspace }}/messenger.ipa
