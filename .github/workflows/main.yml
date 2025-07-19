@@ -17,6 +17,11 @@ on:
         default: "com.facebook.Messenger"
         required: true
         type: string
+      create_release:
+        description: "Create a public GitHub release"
+        default: true
+        required: false
+        type: boolean
       upload_to_appdb:
         description: "Upload and Edit Metadata on appdb"
         default: true
@@ -69,7 +74,12 @@ jobs:
 
       - name: Validate downloaded IPA
         run: |
-          file_type=$(file --mime-type -b ${{ github.workspace }}/messenger.ipa)
+          file_path="${{ github.workspace }}/messenger.ipa"
+          if [ ! -f "$file_path" ]; then
+            echo "::error::Download failed: IPA file not found at $file_path"
+            exit 1
+          fi
+          file_type=$(file --mime-type -b "$file_path")
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
             exit 1
@@ -93,6 +103,7 @@ jobs:
           api_url="https://api.github.com/repos/dayanch96/Flow/releases/latest"
           response=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
           flow_tag=$(echo "$response" | jq -r '.tag_name')
+          release_body=$(echo "$response" | jq -r '.body')
           deb_url=$(echo "$response" | jq -r '.assets[0].browser_download_url')
           if [[ "$deb_url" == "null" || -z "$deb_url" ]]; then
             echo "::error::Failed to get tweak URL from Github API"
@@ -103,6 +114,9 @@ jobs:
           echo "Extracted Messenger Version: $messenger_version"
           echo "FLOW_TAG=${flow_tag}" >> "$GITHUB_OUTPUT"
           echo "MESSENGER_VERSION=${messenger_version}" >> "$GITHUB_OUTPUT"
+          echo "release_body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$release_body" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
           echo "Downloading: $deb_url"
           wget "$deb_url" --no-verbose -O ${{ github.workspace }}/flow_mess.deb
 
@@ -154,6 +168,7 @@ jobs:
               exit 1
             fi
           done
+          
           echo "Step 3: Fetching the new IPA ID..."
           IPA_ID=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}" | jq '(.data | sort_by(.id) | reverse)[0].id')
           if [ -z "$IPA_ID" ] || [ "$IPA_ID" = "null" ]; then
@@ -162,6 +177,7 @@ jobs:
           fi
           echo "Found newest IPA ID: ${IPA_ID}"
           echo "ipa_id=${IPA_ID}" >> "$GITHUB_OUTPUT"
+
           echo "Step 4: Editing IPA metadata..."
           APP_NAME="Messenger v${MESSENGER_VERSION} + Flow ${FLOW_TAG} | Meta Platforms, Inc."
           curl -sS -X POST https://api.dbservices.to/v1.7/edit_ipa_metadata/ \
@@ -191,9 +207,9 @@ jobs:
         run: |
           echo "Step 5: Cleaning up old IPA versions, keeping ID ${NEWEST_IPA_ID}..."
           IPAS_RESPONSE=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}")
-          OLD_IPA_IDS=$(echo "$IPAS_RESPONSE" | jq -r --argjson newest_id "$NEWEST_IPA_ID" '(.data | map(select(.name | contains("Messenger"))) | map(select(.id != $newest_id)) | .[].id)')
+          OLD_IPA_IDS=$(echo "$IPAS_RESPONSE" | jq -r --argjson newest_id "$NEWEST_IPA_ID" '(.data | map(select(.name | contains("Messenger") and contains("Flow"))) | map(select(.id != $newest_id)) | .[].id)')
           if [ -z "$OLD_IPA_IDS" ]; then
-            echo "No old Messenger versions found to delete."
+            echo "No old Flow for Messenger versions found to delete."
           else
             echo "Found old IPAs to delete with IDs: $OLD_IPA_IDS"
             for OLD_ID in $OLD_IPA_IDS; do
@@ -209,10 +225,11 @@ jobs:
           echo "Cleanup finished."
 
       - name: Create GitHub Release
-        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.ipa_url != '')
+        if: (github.event_name == 'workflow_dispatch' && inputs.create_release) || github.event_name == 'schedule'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: flow-mess-${{ steps.versions.outputs.FLOW_TAG }}
-          name: Flow_Mess ${{ steps.versions.outputs.FLOW_TAG }}
+          name: Flow ${{ steps.versions.outputs.FLOW_TAG }} for Messenger v${{ steps.versions.outputs.MESSENGER_VERSION }}
+          body: ${{ steps.versions.outputs.release_body }}
           files: ${{ steps.package_info.outputs.package_name }}
-          draft: true
+          draft: false
