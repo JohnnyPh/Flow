@@ -4,34 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "URL to the decrypted IPA file"
-        default: "https://www.dropbox.com/scl/fi/8ogmveyu7gxzyuyp3dl37/com.facebook.Messenger_515.0.0_und3fined.ipa?rlkey=a4hq5gxtukdoxu3a19pam4mi9&st=81ji4p9b&dl==1"
-        required: true
+        description: "URL to the decrypted IPA file (bỏ trống nếu muốn tải tự động)"
+        required: false
         type: string
-
       display_name:
         description: "App Name (Optional)"
         default: "Messenger"
         required: true
         type: string
-
       bundle_id:
         description: "BundleID (Optional)"
         default: "com.facebook.Messenger"
         required: true
         type: string
-
       upload_to_appdb:
         description: "Upload and Edit Metadata on appdb"
         default: true
         required: false
         type: boolean
-
       cleanup_old_versions:
         description: "Delete older versions of this app from appdb"
         default: true
         required: false
         type: boolean
+  
+  schedule:
+    - cron: '0 0 * * 0'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -56,14 +54,27 @@ jobs:
         with:
           exclude_inputs: display_name,bundle_id
 
-      - name: Download and validate IPA
+      - name: Download IPA (Auto from App Store)
+        if: github.event_name == 'schedule'
+        uses: level3tjg/decryptedappstore-action@main
+        with:
+          appstore_url: "https://apps.apple.com/us/app/messenger/id454638411"
+          path: ${{ github.workspace }}/messenger.ipa
+          token: ${{ secrets.DECRYPTEDAPPSTORE_SESSION_TOKEN }}
+
+      - name: Download IPA (Manual from URL)
+        if: github.event_name == 'workflow_dispatch' && inputs.ipa_url != ''
         run: |
           wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/messenger.ipa
+
+      - name: Validate downloaded IPA
+        run: |
           file_type=$(file --mime-type -b ${{ github.workspace }}/messenger.ipa)
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             echo "::error::Validation failed: The downloaded file is not a valid IPA. Detected type: $file_type."
             exit 1
           fi
+          echo "IPA validation successful."
 
       - name: Install Dependencies
         run: brew install make ldid jq
@@ -79,23 +90,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Download latest Flow release
           api_url="https://api.github.com/repos/dayanch96/Flow/releases/latest"
           response=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$api_url")
           flow_tag=$(echo "$response" | jq -r '.tag_name')
           deb_url=$(echo "$response" | jq -r '.assets[0].browser_download_url')
-
           if [[ "$deb_url" == "null" || -z "$deb_url" ]]; then
             echo "::error::Failed to get tweak URL from Github API"
             exit 1
           fi
-          
-          # Extract Messenger version from IPA URL
-          messenger_version=$(echo "${{ inputs.ipa_url }}" | grep -o -E '[0-9]+(\.[0-9]+)+' | head -n 1)
-
+          unzip -p ${{ github.workspace }}/messenger.ipa 'Payload/*.app/Info.plist' > ${{ github.workspace }}/Info.plist
+          messenger_version=$(plutil -p ${{ github.workspace }}/Info.plist | grep '"CFBundleShortVersionString"' | awk -F'"' '{print $4}')
+          echo "Extracted Messenger Version: $messenger_version"
           echo "FLOW_TAG=${flow_tag}" >> "$GITHUB_OUTPUT"
           echo "MESSENGER_VERSION=${messenger_version}" >> "$GITHUB_OUTPUT"
-          
           echo "Downloading: $deb_url"
           wget "$deb_url" --no-verbose -O ${{ github.workspace }}/flow_mess.deb
 
@@ -117,7 +124,7 @@ jobs:
           mv clean_ipa.ipa "${{ steps.package_info.outputs.package_name }}"
 
       - name: Upload and Edit on appdb
-        if: ${{ inputs.upload_to_appdb }}
+        if: (github.event_name == 'workflow_dispatch' && inputs.upload_to_appdb) || github.event_name == 'schedule'
         id: upload_step
         env:
           APPDB_LINK_TOKEN: ${{ secrets.APPDB_LINK_TOKEN }}
@@ -132,7 +139,6 @@ jobs:
                -F "job_id=${JOB_ID}" \
                -F "ipa=@${PACKAGE_PATH}" \
                --fail
-
           echo "Step 2: Waiting for IPA processing..."
           for i in {1..20}; do
             sleep 15
@@ -148,7 +154,6 @@ jobs:
               exit 1
             fi
           done
-          
           echo "Step 3: Fetching the new IPA ID..."
           IPA_ID=$(curl -sS -X POST https://api.dbservices.to/v1.7/get_ipas/ -F "lt=${APPDB_LINK_TOKEN}" | jq '(.data | sort_by(.id) | reverse)[0].id')
           if [ -z "$IPA_ID" ] || [ "$IPA_ID" = "null" ]; then
@@ -157,7 +162,6 @@ jobs:
           fi
           echo "Found newest IPA ID: ${IPA_ID}"
           echo "ipa_id=${IPA_ID}" >> "$GITHUB_OUTPUT"
-
           echo "Step 4: Editing IPA metadata..."
           APP_NAME="Messenger v${MESSENGER_VERSION} + Flow ${FLOW_TAG} | Meta Platforms, Inc."
           curl -sS -X POST https://api.dbservices.to/v1.7/edit_ipa_metadata/ \
@@ -180,7 +184,7 @@ jobs:
           echo "Metadata updated successfully!"
 
       - name: Cleanup Old Versions on appdb
-        if: ${{ inputs.upload_to_appdb && inputs.cleanup_old_versions }}
+        if: (github.event_name == 'workflow_dispatch' && inputs.upload_to_appdb && inputs.cleanup_old_versions) || github.event_name == 'schedule'
         env:
           APPDB_LINK_TOKEN: ${{ secrets.APPDB_LINK_TOKEN }}
           NEWEST_IPA_ID: ${{ steps.upload_step.outputs.ipa_id }}
@@ -205,6 +209,7 @@ jobs:
           echo "Cleanup finished."
 
       - name: Create GitHub Release
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.ipa_url != '')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: flow-mess-${{ steps.versions.outputs.FLOW_TAG }}
